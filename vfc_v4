@@ -1,0 +1,338 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image
+from openpyxl.styles import Alignment, PatternFill, NamedStyle, Border, Side, Font
+from openpyxl.utils import get_column_letter
+import pandas as pd
+import pyviewfactor as pvf
+import time
+import pyvista as pv
+from tqdm import tqdm
+
+start = time.time()
+
+########################################################################################################
+#####  ÇİZİM  ##########################################################################################
+########################################################################################################
+
+# zeminin dikdörtgen olarak çizimi
+X = 3.0
+ground = pv.Plane(center=(0, 0, 0), i_size=X, j_size=X)
+
+# kabinin küre olarak çizimi
+sky = pv.Sphere(radius=1.0, center=(0, 0, 0), direction=(0, 0, 1),
+                 theta_resolution=16, phi_resolution=16)
+#----------------theta: meridyen      phi: enlem
+
+# kürenin yalnızca üst yarısını almak ve yüzeyleri içe çevirmek
+sky = sky.clip(normal=(0, 0, -1), origin=(0, 0, 0), invert=True)
+sky.flip_faces(inplace=True)
+
+# Kutuların boyut ve konum bilgileri
+box_definitions = {
+    "U01": {
+        "dims": (0.300, 0.252, 0.013),
+        "coordinates": [
+            (+0.00, +0.000, +0.072),
+            (+0.00, +0.000, +0.137),
+            (+0.00, +0.000, +0.202),
+            (+0.00, +0.000, +0.267),
+        ]
+    },
+    "HUMS": {
+        "dims": (0.290, 0.225, 0.040),
+        "coordinates": [
+            (+0.000, +0.275, +0.000),
+            (+0.000, +0.275, +0.155),
+        ]
+    },
+    "IDU": {
+        "dims": (0.128, 0.130, 0.055),
+        "coordinates": [
+            (+0.000, -0.226, +0.000),
+            (+0.000, -0.226, +0.118),
+            (+0.000, -0.226, +0.236),
+        ]
+    },
+}
+
+# kutu çizme fonksiyonu
+def create_boxes(box_defs):
+    all_boxes = {}
+    for name, props in box_defs.items():
+        dims = props["dims"]
+        coords = props["coordinates"]
+        boxes = {
+            f"{name}{i+1}": pv.Box(bounds=(x, x + dims[0], y, y + dims[1], z, z + dims[2]))
+            for i, (x, y, z) in enumerate(coords)
+        }
+        all_boxes.update(boxes)
+    return all_boxes
+
+# kutuların çizimi
+all_boxes = create_boxes(box_definitions)
+
+########################################################################################################
+#####  RENKLENDİRME & YÜZEY HAZIRLAMA  #################################################################
+########################################################################################################
+
+combined_surfaces = pv.MultiBlock([ground, sky])
+face_dict = {}
+
+colors = {
+    "U01" : np.array([0.00, 0.00, 1.00]),
+    "HUMS": np.array([0.50, 0.50, 0.00]),
+    "IDU" : np.array([0.00, 0.50, 0.50]),
+}
+
+direction_map = {
+    (-1.0, 0.0, 0.0): "x-",
+    ( 1.0, 0.0, 0.0): "x+",
+    ( 0.0,-1.0, 0.0): "y-",
+    ( 0.0, 1.0, 0.0): "y+",
+    ( 0.0, 0.0,-1.0): "z-",    
+    ( 0.0, 0.0, 1.0): "z+",
+}
+
+for box_name, box_mesh in all_boxes.items():
+    
+    group_key = ''.join([char for char in box_name if not char.isdigit()])    
+    
+    for cell_index in range(box_mesh.n_cells):
+        face = box_mesh.extract_cells(cell_index)
+        face_surface = face.extract_surface()
+        normals = face_surface.compute_normals(cell_normals=True, point_normals=False)
+        normal = normals.cell_data["Normals"][0]
+        
+        rounded = tuple(np.round(normal).astype(int))
+        direction = direction_map.get(rounded, f'face{cell_index}')
+        
+        face_name = f'{box_name}_{direction}'
+        
+        face.cell_data['face_name'] = np.full(face.n_cells, face_name, dtype='<U20')
+        color = colors.get(group_key, np.array([1.0, 0.0, 0.0]))
+        face.cell_data['color'] = np.tile(color, (face.n_cells, 1))        
+
+        combined_surfaces.append(face)
+        face_dict[face_name] = face
+
+# Ortam atamaları
+sky.cell_data["wall_mesh_names"] = np.full(sky.n_cells, "sky", dtype='<U20')
+ground.cell_data["wall_mesh_names"] = np.full(ground.n_cells, "ground", dtype='<U20')
+for key, box in all_boxes.items():
+    box.cell_data["wall_mesh_names"] = np.full(box.n_cells, key, dtype='<U20')
+for face_name, face in face_dict.items():
+    face.cell_data["wall_mesh_names"] = np.full(face.n_cells, face_name, dtype='<U20')
+
+# Gösterim
+plotter = pv.Plotter()
+# Sky yüzeyinden normalleri hesapla
+sky_surface = sky.extract_surface()
+sky_normals = sky_surface.compute_normals(cell_normals=True, point_normals=False)
+
+for mesh, color in zip([ground, sky], ["lightblue", "lightblue"]):
+    plotter.add_mesh(mesh, color=color, opacity=0.5)
+    
+for face_name, face in face_dict.items():
+    face.set_active_scalars("color")
+    plotter.add_mesh(face, rgb=True)
+    
+    face_surface = face.extract_surface()
+    normals = face_surface.compute_normals(cell_normals=True, point_normals=False)
+    direction = normals.cell_data["Normals"][0]
+    center = face_surface.center
+   
+for name, box in all_boxes.items():
+    center = box.center
+    plotter.add_point_labels([center], [name], text_color='black', font_size=10)
+plotter.add_axes()
+plotter.camera_position = [(5, 5, 5), (0, 0, 0), (0, 0, 1)]
+plotter.show_grid()
+end_drawing = time.time()
+plotter.show()
+
+start_calculation = time.time()
+# VTK Kaydı
+combined_mesh = pv.MultiBlock([ground, sky] + list(all_boxes.values()))
+merged_mesh = combined_mesh.combine()
+merged_mesh.save("mini.vtk")
+print("✅ Custom VTK file created: mini.vtk")
+
+########################################################################################################
+##### GÖRME FAKTÖRÜ HESAPLARI ##########################################################################
+########################################################################################################
+
+mesh = merged_mesh
+meshpoly = pvf.fc_unstruc2poly(mesh)
+
+all_face_results = {}
+
+for box_prefix in all_boxes.keys():
+    target_faces = [n for n in face_dict if n.startswith(f"{box_prefix}_")]
+    for target_face_name in target_faces:
+        print(f"\n🔵 {target_face_name} hedef yüzey olarak seçildi")
+        target_face_mesh = pvf.fc_unstruc2poly(face_dict[target_face_name])
+
+        # Tüm hedef kutuları topla
+        names = [target_face_name, "sky"] + list(all_boxes.keys())
+        indices = {f"i_{name}": np.where(mesh['wall_mesh_names'] == name)[0] for name in names}
+        # i_target, i_sky = indices[f"i_{target_face_name}"], indices["i_sky"]
+        i_sky = indices["i_sky"]
+
+        i_boxes = [(name, indices[f"i_{name}"])
+                   for name in all_boxes.keys()
+                   if name != target_face_name.split('_')[0]]
+        
+        face_groups = [("sky", i_sky)] + i_boxes
+
+        results = {}
+        for label, face_indices in face_groups:
+            F = 0
+            for patch in tqdm(face_indices, desc=f"{target_face_name} ile {label}"):
+                surface = mesh.extract_cells(patch)
+                surface = pvf.fc_unstruc2poly(surface)
+                if pvf.get_visibility(surface, target_face_mesh, strict=True):
+                    if pvf.get_visibility_raytrace(surface, target_face_mesh, meshpoly):
+                        F += pvf.compute_viewfactor(surface, target_face_mesh)
+            results[f"{label.upper()}"] = F
+
+        Fground = 1 - sum(results.values())
+        results['Ground'] = Fground
+        results['Ftoplam'] = sum(results.values())
+
+        all_face_results[target_face_name] = results
+
+box_totals = {}
+for face_name, res in all_face_results.items():
+    box_name = face_name.split("_")[0]
+    totals = box_totals.setdefault(box_name, {})
+    for k, v in res.items():
+        totals[k] = totals.get(k, 0) + v
+
+# Excel çıktı
+
+df_faces = pd.DataFrame.from_dict(all_face_results, orient='index')
+df_faces.index.name = 'Yüzey'
+
+df_boxes = pd.DataFrame.from_dict(box_totals, orient='index')
+df_boxes.index.name = 'Kutu'
+
+cols_b = list(df_boxes.columns)
+if "Ftoplam" in cols_b:
+    cols_b.remove("Ftoplam")
+if "U011" in cols_b:
+    cols_b.remove("U011")
+    cols_b = ["U011"] + cols_b
+if "SKY" in cols_b:
+    cols_b.remove("SKY")
+    cols_b = cols_b + ["SKY"]
+
+df_boxes = df_boxes[cols_b]    
+
+cols_f = list(df_faces.columns)
+if "U011" in cols_f:
+    cols_f.remove("U011")
+    cols_f = ["U011"] + cols_f
+if "SKY" in cols_f:
+    cols_f.remove("SKY")
+    cols_f = cols_f + ["SKY"]
+if "Ftoplam" in cols_f:
+    cols_f.remove("Ftoplam")
+    cols_f = cols_f + ["Ftoplam"]
+
+df_faces = df_faces[cols_f]    
+
+with pd.ExcelWriter('Table_A.4_&_Dimensions.xlsx', mode='a', engine='openpyxl', if_sheet_exists='replace',
+) as writer:
+    df_faces.to_excel(writer, sheet_name='View Factors', startcol=1)
+    df_boxes.to_excel(writer, sheet_name='Box Totals', startcol=0)
+
+print("✅ Excel sayfası eklendi.")
+
+########################################################################################################
+#####  EXCEL BİÇİMLENDİRME  ############################################################################
+########################################################################################################
+
+wb = load_workbook("Table_A.4_&_Dimensions.xlsx")
+ws_view   = wb["View Factors"]
+ws_totals = wb["Box Totals"]
+
+# Renkler
+fill_colors = {
+    "too_high_result":  '274E13', # çok koyu yeşil
+    "high_result":      '548235', # koyu yeşil
+    "regular_result":   'A9D08E', # yeşil
+    "low_result":       'C6EFCE', # açık yeşil
+    "zero_result":      'D9D9D9', # gri
+    "headers":          '1F4E79', # koyu mavi
+    "toplam":           '9BC2E6'  # mavi
+}
+fills = {name: PatternFill(start_color=code, end_color=code, fill_type='solid') for name, code in fill_colors.items()}
+
+# Kenarlıklar
+thin_border = Border(
+    left   =Side(style='thin', color='000000'),
+    right  =Side(style='thin', color='000000'),
+    top    =Side(style='thin', color='000000'),
+    bottom =Side(style='thin', color='000000'),
+)
+
+# Hücre biçimlendirme
+def format_sheet(ws):
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            val = cell.value
+            
+            if isinstance(val, (int, float)):
+                cell.font = Font(name='Courier', size=20, bold=True)
+                cell.number_format = '0.000'
+                if val > 0.99:
+                    cell.fill = fills["toplam"]
+                elif val > 0.9:
+                    cell.fill = fills["too_high_result"]
+                    cell.font = Font(name='Courier', size=20, bold=True, color='FFFFFF')
+                elif val > 0.5:
+                    cell.fill = fills["high_result"]
+                    cell.font = Font(name='Courier', size=20, bold=True, color='FFFFFF')
+                elif val > 0.3:
+                    cell.fill = fills["regular_result"]
+                elif val > 0.0:
+                    cell.fill = fills["low_result"]
+                else:
+                    cell.fill = fills["zero_result"]        
+            elif isinstance(val, str):
+                cell.fill = fills["headers"]
+                cell.font = Font(name='Arial', size=20, bold=True, color='FFFFFF')
+                
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = thin_border
+
+    column_number = len(all_boxes) + 5 + 1
+    for col in range(1, column_number):
+        col_letter = get_column_letter(col)
+        ws.column_dimensions[col_letter].width = 150 / 7.0017
+    for row in range (2, ws.max_row + 1):
+        ws.row_dimensions[row].height = 150/1.33
+        
+format_sheet(ws_view)
+format_sheet(ws_totals)
+
+image_files = ["x-.jpg", "x+.jpg", "y-.jpg", "y+.jpg", "z-.jpg", "z+.jpg"]
+for i, filename in enumerate(image_files, start=2):
+    img = Image(filename)
+    img.width  = 150
+    img.height = 150
+    cell = f"A{i}"
+    ws_view.add_image(img, cell)
+
+ws_view.sheet_view.zoomScale = 80          
+ws_totals.sheet_view.zoomScale = 55          
+wb.save("Table_A.4_&_Dimensions.xlsx")
+print("🎨 Biçimlendirme tamamlandı.")
+
+end = time.time()
+
+print(f"Bütün işlemler toplamda {(end - start_calculation)+(end_drawing - start):.2f} saniye sürdü.")
+print(f"Çizim:     {end_drawing - start:.2f} saniye.")
+print(f"Hesaplama: {end - start_calculation:.2f} saniye.")
